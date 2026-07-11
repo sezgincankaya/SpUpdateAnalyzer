@@ -1,113 +1,201 @@
-﻿using ConsoleApp3.Parsing;
+﻿using ConsoleApp3.Database;
+using ConsoleApp3.Models;
+using ConsoleApp3.Parsing;
 using ConsoleApp3.Reporting;
+using Microsoft.Extensions.Configuration;
 using System.Text.Json;
 
-// ---- Argüman parse ----
-string? inputFile = null;
+// ─────────────────────────────────────────────
+// Argüman parse
+// ─────────────────────────────────────────────
+string? connectionString = null;
 string? outputFile = null;
 string? tablesFile = null;
 var verbose = false;
+var threadCount = Environment.ProcessorCount;
 
 for (var i = 0; i < args.Length; i++)
 {
     switch (args[i])
     {
-        case "--input" when i + 1 < args.Length:
-            inputFile = args[++i];
+        case "--connection" when i + 1 < args.Length: connectionString = args[++i]; break;
+        case "--output"     when i + 1 < args.Length: outputFile       = args[++i]; break;
+        case "--tables"     when i + 1 < args.Length: tablesFile       = args[++i]; break;
+        case "--threads"    when i + 1 < args.Length:
+            if (!int.TryParse(args[++i], out threadCount) || threadCount <= 0)
+            {
+                Console.Error.WriteLine("[HATA] --threads değeri pozitif bir tam sayı olmalıdır.");
+                Environment.Exit(1);
+            }
             break;
-        case "--output" when i + 1 < args.Length:
-            outputFile = args[++i];
-            break;
-        case "--tables" when i + 1 < args.Length:
-            tablesFile = args[++i];
-            break;
-        case "--verbose":
-            verbose = true;
-            break;
+        case "--verbose": verbose = true; break;
     }
 }
 
-inputFile ??= "scripts.sql";
-outputFile ??= "result.xlsx";
+outputFile ??= $"result_{DateTime.Now:yyyyMMdd_HHmmss}.xlsx";
 tablesFile ??= "tables.json";
 
-// ---- Dosya kontrolleri ----
-if (!File.Exists(inputFile))
+// ─────────────────────────────────────────────
+// Bağlantı string'i — önce appsettings, sonra argüman, en son prompt
+// ─────────────────────────────────────────────
+if (string.IsNullOrWhiteSpace(connectionString))
 {
-    Console.Error.WriteLine($"[HATA] Girdi dosyası bulunamadı: {inputFile}");
+    var config = new ConfigurationBuilder()
+        .SetBasePath(AppContext.BaseDirectory)
+        .AddJsonFile("appsettings.json", optional: true, reloadOnChange: false)
+        .Build();
+
+    connectionString = config.GetConnectionString("Boa");
+}
+
+if (string.IsNullOrWhiteSpace(connectionString))
+{
+    Console.Write("SQL Server bağlantı string'i: ");
+    connectionString = Console.ReadLine()?.Trim();
+}
+
+if (string.IsNullOrWhiteSpace(connectionString))
+{
+    Console.Error.WriteLine("[HATA] Bağlantı string'i boş olamaz.");
     Environment.Exit(1);
 }
+
+// ─────────────────────────────────────────────
+// Tablo listesi — yoksa DB'den otomatik üret
+// ─────────────────────────────────────────────
+List<string> targetTables;
 
 if (!File.Exists(tablesFile))
 {
-    Console.Error.WriteLine($"[HATA] Tablo listesi dosyası bulunamadı: {tablesFile}");
-    Environment.Exit(1);
-}
+    Console.WriteLine($"[BİLGİ] '{tablesFile}' bulunamadı. Veritabanından tablo listesi alınıyor...");
+    try
+    {
+        var tempReader = new SqlServerReader(connectionString!);
+        // Initial Catalog varsa doğrudan o DB; yoksa ilk kullanıcı DB'si
+        var builder = new Microsoft.Data.SqlClient.SqlConnectionStringBuilder(connectionString);
+        var targetDb = !string.IsNullOrWhiteSpace(builder.InitialCatalog)
+            ? builder.InitialCatalog
+            : (await tempReader.GetUserDatabasesAsync()).FirstOrDefault();
 
-// ---- Tablo listesini oku ----
-List<string> targetTables;
-try
+        if (targetDb is null)
+        {
+            Console.Error.WriteLine("[HATA] Hedef veritabanı bulunamadı.");
+            Environment.Exit(1);
+            return;
+        }
+
+        targetTables = await tempReader.GetAllTablesAsync(targetDb);
+
+        if (targetTables.Count == 0)
+        {
+            Console.Error.WriteLine($"[HATA] '{targetDb}' veritabanında tablo bulunamadı.");
+            Environment.Exit(1);
+            return;
+        }
+
+        var jsonContent = JsonSerializer.Serialize(
+            new { tables = targetTables },
+            new JsonSerializerOptions { WriteIndented = true });
+
+        await File.WriteAllTextAsync(tablesFile, jsonContent);
+        Console.WriteLine($"[BİLGİ] {targetTables.Count} tablo '{tablesFile}' dosyasına yazıldı (DB: {targetDb}).");
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"[HATA] Tablo listesi oluşturulamadı: {ex.Message}");
+        Environment.Exit(1);
+        return;
+    }
+}
+else
 {
-    var json = File.ReadAllText(tablesFile);
-    var doc = JsonDocument.Parse(json);
-    targetTables = doc.RootElement
-        .GetProperty("tables")
-        .EnumerateArray()
-        .Select(e => e.GetString() ?? string.Empty)
-        .Where(s => !string.IsNullOrWhiteSpace(s))
-        .ToList();
-}
-catch (Exception ex)
-{
-    Console.Error.WriteLine($"[HATA] Tablo listesi okunamadı: {ex.Message}");
-    Environment.Exit(1);
-    return;
-}
-
-Console.WriteLine($"Hedef tablo sayısı   : {targetTables.Count}");
-Console.WriteLine($"Girdi dosyası        : {inputFile}");
-Console.WriteLine($"Çıktı dosyası        : {outputFile}");
-Console.WriteLine($"Verbose modu         : {(verbose ? "Açık" : "Kapalı")}");
-Console.WriteLine(new string('-', 50));
-
-// ---- SP'leri parse et ----
-Dictionary<string, string> spMap;
-try
-{
-    spMap = SqlScriptParser.ParseStoredProcedures(inputFile);
-}
-catch (Exception ex)
-{
-    Console.Error.WriteLine($"[HATA] Script dosyası okunamadı: {ex.Message}");
-    Environment.Exit(1);
-    return;
+    try
+    {
+        var json = File.ReadAllText(tablesFile);
+        var doc = JsonDocument.Parse(json);
+        targetTables = doc.RootElement
+            .GetProperty("tables")
+            .EnumerateArray()
+            .Select(e => e.GetString() ?? string.Empty)
+            .Where(s => !string.IsNullOrWhiteSpace(s))
+            .ToList();
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"[HATA] Tablo listesi okunamadı: {ex.Message}");
+        Environment.Exit(1);
+        return;
+    }
 }
 
-Console.WriteLine($"Toplam SP sayısı     : {spMap.Count}");
+// ─────────────────────────────────────────────
+// Başlangıç bilgisi
+// ─────────────────────────────────────────────
+Console.ForegroundColor = ConsoleColor.White;
+Console.WriteLine(new string('═', 60));
+Console.WriteLine("  SP Update Kolon Analizörü");
+Console.WriteLine(new string('═', 60));
+Console.ResetColor();
+Console.WriteLine($"  Hedef tablo sayısı : {targetTables.Count}");
+Console.WriteLine($"  Çıktı dosyası      : {outputFile}");
+Console.WriteLine($"  Verbose            : {(verbose ? "Açık" : "Kapalı")}");
+Console.WriteLine($"  Thread sayısı      : {threadCount}");
+Console.WriteLine();
 
-// ---- Her SP'yi analiz et ----
+// ─────────────────────────────────────────────
+// Tarama
+// ─────────────────────────────────────────────
+var reader = new SqlServerReader(connectionString);
 var analyzer = new UpdateStatementAnalyzer(targetTables, verbose);
-var allResults = spMap
-    .Select(kv => analyzer.Analyze(kv.Key, kv.Value))
-    .ToList();
+var scanner = new DatabaseScanner(reader, analyzer, verbose, threadCount);
 
-// ---- Özet konsola yaz ----
-Console.WriteLine("\n--- Analiz Özeti ---");
-foreach (var r in allResults)
+using var cts = new CancellationTokenSource();
+
+// Ctrl+C ile temiz iptal
+Console.CancelKeyPress += (_, e) =>
 {
-    if (r.TotalTargetUpdateCount == 0 && !r.HasDynamicSqlWarning) continue;
-    var status = r.MissingColumnCount > 0 ? "EKSİK KOLON" : "OK";
-    if (r.HasDynamicSqlWarning) status += " [DİNAMİK SQL UYARISI]";
-    Console.WriteLine($"  {r.SpName,-50} → {status}");
+    e.Cancel = true;
+    Console.WriteLine("\n[İPTAL] Kullanıcı tarafından durduruldu...");
+    cts.Cancel();
+};
+
+List<SpAnalysisResult> allResults;
+try
+{
+    allResults = await scanner.ScanAllAsync(cts.Token);
+}
+catch (OperationCanceledException)
+{
+    Console.WriteLine("Tarama iptal edildi. Mevcut sonuçlar raporlanıyor...");
+    allResults = new();
+}
+catch (Exception ex)
+{
+    Console.Error.WriteLine($"[HATA] Beklenmeyen hata: {ex.Message}");
+    Environment.Exit(1);
+    return;
 }
 
-// ---- Excel raporunu oluştur ----
+// ─────────────────────────────────────────────
+// Excel raporu
+// ─────────────────────────────────────────────
+if (allResults.Count == 0)
+{
+    Console.WriteLine("Analiz edilecek sonuç bulunamadı.");
+    return;
+}
+
 try
 {
     ExcelReporter.WriteReport(allResults, outputFile);
+    ProgressReporter.Summary(
+        allResults.Select(r => r.DatabaseName).Distinct().Count(),
+        allResults.Count,
+        allResults.Sum(r => r.MissingColumnCount),
+        outputFile);
 }
 catch (Exception ex)
 {
-    Console.Error.WriteLine($"[HATA] Excel dosyası yazılamadı: {ex.Message}");
+    Console.Error.WriteLine($"[HATA] Excel yazılamadı: {ex.Message}");
     Environment.Exit(1);
 }
