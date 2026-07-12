@@ -188,10 +188,15 @@ public class DatabaseScanner
                         return;
                     }
 
-                    ProgressReporter.SpResult(
-                        spName,
-                        result.MissingColumnCount > 0,
-                        result.HasDynamicSqlWarning);
+                    // SP bazlı detaylar sadece verbose modda konsola yazılır;
+                    // eksik kolon / dinamik SQL detayları Excel raporunda yer alır.
+                    if (_verbose)
+                    {
+                        ProgressReporter.SpResult(
+                            spName,
+                            result.MissingColumnCount > 0,
+                            result.HasDynamicSqlWarning);
+                    }
 
                     schemaResults.Add(result);
                 });
