@@ -201,6 +201,40 @@ public class SqlServerReader
         return result is DBNull || result is null ? null : (string)result;
     }
 
+    /// <summary>
+    /// Belirtilen veritabanındaki TÜM SP'lerin definition'larını tek sorguda döner.
+    /// SP başına ayrı bağlantı/round-trip maliyetini ortadan kaldırır.
+    /// </summary>
+    public async Task<List<(string Schema, string SpName, string Definition)>> GetAllSpDefinitionsAsync(
+        string database,
+        CancellationToken ct = default)
+    {
+        const string sql = @"
+            SELECT s.name       AS SchemaName,
+                   p.name       AS ProcName,
+                   m.definition AS Definition
+            FROM   sys.procedures p
+            INNER JOIN sys.schemas     s ON s.schema_id = p.schema_id
+            INNER JOIN sys.sql_modules m ON m.object_id = p.object_id
+            WHERE  p.type = 'P'
+            ORDER BY s.name, p.name";
+
+        var result = new List<(string, string, string)>();
+
+        await using var conn = new SqlConnection(BuildConnectionString(database));
+        await conn.OpenAsync(ct);
+        await using var cmd = new SqlCommand(sql, conn) { CommandTimeout = 300 };
+        await using var rdr = await cmd.ExecuteReaderAsync(ct);
+
+        while (await rdr.ReadAsync(ct))
+        {
+            var definition = rdr.IsDBNull(2) ? string.Empty : rdr.GetString(2);
+            result.Add((rdr.GetString(0), rdr.GetString(1), definition));
+        }
+
+        return result;
+    }
+
     // -------------------------------------------------------------------------
     // Yardımcı
     // -------------------------------------------------------------------------
