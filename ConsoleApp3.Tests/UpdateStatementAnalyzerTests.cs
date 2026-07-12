@@ -325,4 +325,88 @@ UPDATE Orders SET Status = 1";
         Assert.DoesNotContain("UPDATE Orders", masked);
         Assert.Contains("__STR__", masked);
     }
+
+    // -------------------------------------------------------------------------
+    // 18. EXEC(@var) formatındaki dinamik SQL — uyarı verilmeli
+    // -------------------------------------------------------------------------
+    [Fact]
+    public void ExecVariable_ShouldRaiseDynamicSqlWarning()
+    {
+        const string sp = @"
+CREATE PROCEDURE dbo.usp_ExecVar AS BEGIN
+    DECLARE @sql NVARCHAR(MAX) = N'UPDATE Orders SET Status = 1'
+    EXEC (@sql)
+END";
+        var analyzer = CreateAnalyzer("Orders");
+        var result = analyzer.Analyze("usp_ExecVar", sp);
+
+        Assert.True(result.HasDynamicSqlWarning);
+    }
+
+    // -------------------------------------------------------------------------
+    // 19. Dinamik SQL uyarısı UPDATE ifadelerine de yansımalı
+    // -------------------------------------------------------------------------
+    [Fact]
+    public void DynamicSql_ShouldPropagateToUpdateStatements()
+    {
+        const string sp = @"
+CREATE PROCEDURE dbo.usp_Mixed AS BEGIN
+    UPDATE dbo.Orders
+    SET Status = 1, UpdatedDate = GETDATE()
+    WHERE Id = 1
+
+    DECLARE @sql NVARCHAR(MAX) = N'SELECT 1'
+    EXEC sp_executesql @sql
+END";
+        var analyzer = CreateAnalyzer("Orders");
+        var result = analyzer.Analyze("usp_Mixed", sp);
+
+        Assert.Equal(1, result.TotalTargetUpdateCount);
+        Assert.All(result.UpdateStatements, u => Assert.True(u.HasDynamicSqlWarning));
+    }
+
+    // -------------------------------------------------------------------------
+    // 20. UPDATE ifadesinin satır numarası ve snippet dolu olmalı
+    // -------------------------------------------------------------------------
+    [Fact]
+    public void UpdateStatement_ShouldHaveLineNumberAndSnippet()
+    {
+        const string sp = @"
+CREATE PROCEDURE dbo.usp_LineTest AS BEGIN
+    SELECT 1
+
+    UPDATE dbo.Orders
+    SET Status = 1
+    WHERE Id = 1
+END";
+        var analyzer = CreateAnalyzer("Orders");
+        var result = analyzer.Analyze("usp_LineTest", sp);
+
+        var stmt = Assert.Single(result.UpdateStatements);
+        Assert.True(stmt.LineNumber > 1, "Satır numarası 1'den büyük olmalı");
+        Assert.Contains("UPDATE", stmt.UpdateSnippet, StringComparison.OrdinalIgnoreCase);
+    }
+
+    // -------------------------------------------------------------------------
+    // 21. SET kolonları doğru çıkarılmalı
+    // -------------------------------------------------------------------------
+    [Fact]
+    public void SetColumns_ShouldBeExtractedCorrectly()
+    {
+        const string sp = @"
+CREATE PROCEDURE dbo.usp_SetCols AS BEGIN
+    UPDATE dbo.Orders
+    SET Status = 1,
+        Amount = 250,
+        UpdatedDate = GETDATE()
+    WHERE Id = 1
+END";
+        var analyzer = CreateAnalyzer("Orders");
+        var result = analyzer.Analyze("usp_SetCols", sp);
+
+        var stmt = Assert.Single(result.UpdateStatements);
+        Assert.Contains("Status", stmt.SetColumns, StringComparer.OrdinalIgnoreCase);
+        Assert.Contains("Amount", stmt.SetColumns, StringComparer.OrdinalIgnoreCase);
+        Assert.Contains("UpdatedDate", stmt.SetColumns, StringComparer.OrdinalIgnoreCase);
+    }
 }

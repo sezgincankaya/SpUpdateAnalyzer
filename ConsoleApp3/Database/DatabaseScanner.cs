@@ -32,6 +32,11 @@ public class DatabaseScanner
     }
 
     /// <summary>
+    /// Son taramanın toplam süresi.
+    /// </summary>
+    public TimeSpan Elapsed { get; private set; }
+
+    /// <summary>
     /// Tüm sunucuyu tarar, sonuçları döner.
     /// </summary>
     public async Task<List<SpAnalysisResult>> ScanAllAsync(CancellationToken ct = default)
@@ -53,7 +58,25 @@ public class DatabaseScanner
 
         ProgressReporter.Info($"Bulunan kullanıcı DB sayısı: {databases.Count}");
 
+        // DB başına SP sayılarını al ve başlangıçta özet göster
+        var dbOverview = new List<(string Database, int SpCount)>(databases.Count);
+        foreach (var db in databases)
+        {
+            ct.ThrowIfCancellationRequested();
+            try
+            {
+                dbOverview.Add((db, await _reader.GetStoredProcedureCountAsync(db, ct)));
+            }
+            catch (Exception ex)
+            {
+                ProgressReporter.Warning($"'{db}' SP sayısı alınamadı: {ex.Message}");
+                dbOverview.Add((db, 0));
+            }
+        }
+        ProgressReporter.Overview(dbOverview);
+
         int totalDbMissing = 0, totalDbSp = 0;
+        var totalStopwatch = System.Diagnostics.Stopwatch.StartNew();
 
         // 2. Her DB için
         for (var dbIdx = 0; dbIdx < databases.Count; dbIdx++)
@@ -61,9 +84,12 @@ public class DatabaseScanner
             ct.ThrowIfCancellationRequested();
 
             var db = databases[dbIdx];
+            var dbStopwatch = System.Diagnostics.Stopwatch.StartNew();
             ProgressReporter.Database(db, dbIdx + 1, databases.Count);
 
             int dbSpCount = 0, dbMissingCount = 0;
+            var dbTotalSp = dbOverview[dbIdx].SpCount;
+            var dbProcessedSp = 0;
 
             // 3. Şemaları al
             List<string> schemas;
@@ -89,7 +115,6 @@ public class DatabaseScanner
                 ct.ThrowIfCancellationRequested();
 
                 var schema = schemas[schemaIdx];
-                ProgressReporter.Schema(schema, schemaIdx + 1, schemas.Count);
 
                 // 5. SP listesini al
                 List<(string Schema, string SpName)> spList;
@@ -118,8 +143,9 @@ public class DatabaseScanner
                 await Parallel.ForEachAsync(spList, parallelOptions, async (sp, token) =>
                 {
                     var (spSchema, spName) = sp;
-                    var current = Interlocked.Increment(ref processedCount);
-                    ProgressReporter.StoredProcedure(spName, current, spList.Count);
+                    Interlocked.Increment(ref processedCount);
+                    var currentDb = Interlocked.Increment(ref dbProcessedSp);
+                    ProgressReporter.Progress(currentDb, dbTotalSp);
 
                     // Definition'ı çek
                     string? definition;
@@ -178,15 +204,17 @@ public class DatabaseScanner
                 }
 
                 dbMissingCount += schemaMissing;
-                ProgressReporter.SchemaComplete(schema, spList.Count, schemaMissing);
             }
 
             totalDbSp += dbSpCount;
             totalDbMissing += dbMissingCount;
-            ProgressReporter.DatabaseComplete(db, dbSpCount, dbMissingCount);
+            dbStopwatch.Stop();
+            ProgressReporter.DatabaseComplete(db, dbSpCount, dbMissingCount, dbStopwatch.Elapsed);
         }
 
-        ProgressReporter.Summary(databases.Count, totalDbSp, totalDbMissing, string.Empty);
+        totalStopwatch.Stop();
+        Elapsed = totalStopwatch.Elapsed;
+        ProgressReporter.Summary(databases.Count, totalDbSp, totalDbMissing, string.Empty, totalStopwatch.Elapsed);
         return allResults;
     }
 }

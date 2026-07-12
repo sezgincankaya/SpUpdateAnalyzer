@@ -12,7 +12,7 @@ string? connectionString = null;
 string? outputFile = null;
 string? tablesFile = null;
 var verbose = false;
-var threadCount = Environment.ProcessorCount;
+var threadCount = Environment.ProcessorCount*2;
 
 for (var i = 0; i < args.Length; i++)
 {
@@ -192,7 +192,8 @@ try
         allResults.Select(r => r.DatabaseName).Distinct().Count(),
         allResults.Count,
         allResults.Sum(r => r.MissingColumnCount),
-        outputFile);
+        outputFile,
+        scanner.Elapsed);
 }
 catch (Exception ex)
 {
