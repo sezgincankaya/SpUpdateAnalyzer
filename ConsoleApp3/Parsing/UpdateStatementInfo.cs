@@ -11,12 +11,13 @@ namespace ConsoleApp3.Parsing;
 public class UpdateStatementAnalyzer
 {
     // UPDATE ifadesinin başlangıcını yakalar: UPDATE [alias_or_table]
+    // Temp tablo (#tmp) ve tablo değişkenleri (@var) de yakalanır ki bilinçli atlanabilsin.
     private const string UpdateKeywordPattern =
-        @"\bUPDATE\s+((?:\[[\w\s]+\]|[\w]+)(?:\.(?:\[[\w\s]+\]|[\w]+)){0,2})";
+        @"\bUPDATE\s+((?:\[[\w\s#@]+\]|[#@]?[\w]+)(?:\.(?:\[[\w\s#@]+\]|[#@]?[\w]+)){0,2})";
 
     // FROM bloğu içinde alias tanımını yakalar: tablo_adı alias veya tablo_adı AS alias
     private const string AliasPattern =
-        @"(?:FROM|JOIN)\s+((?:\[[\w\s]+\]|[\w]+)(?:\.(?:\[[\w\s]+\]|[\w]+)){0,2})\s+(?:AS\s+)?([\w]+)";
+        @"(?:FROM|JOIN)\s+((?:\[[\w\s#@]+\]|[#@]?[\w]+)(?:\.(?:\[[\w\s#@]+\]|[#@]?[\w]+)){0,2})\s+(?:AS\s+)?([\w]+)";
 
     // SET bloğunu yakalar (UPDATE...SET...WHERE/FROM/; arasındaki kısım)
     private const string SetBlockPattern =
@@ -88,25 +89,45 @@ public class UpdateStatementAnalyzer
             Log("  [UYARI] Dinamik SQL tespit edildi.");
         }
 
-        // 3. Alias haritasını çıkar: alias → normalized tablo adı
-        var aliasMap = BuildAliasMap(masked);
-        Log($"  Alias haritası: {string.Join(", ", aliasMap.Select(kv => $"{kv.Key}→{kv.Value}"))}");
-
-        // 4. UPDATE ifadelerini bul
+        // 3. UPDATE ifadelerini bul
         var updateMatches = UpdateRegex.Matches(masked);
         Log($"  Bulunan UPDATE sayısı: {updateMatches.Count}");
 
-        foreach (Match updateMatch in updateMatches)
+        for (var i = 0; i < updateMatches.Count; i++)
         {
+            var updateMatch = updateMatches[i];
             var rawRef = updateMatch.Groups[1].Value.Trim();
+
+            // Temp tablo veya tablo değişkenine yapılan UPDATE'ler dahil edilmez.
+            if (IsTempOrVariableReference(rawRef))
+            {
+                Log($"  Temp tablo / tablo değişkeni UPDATE'i atlandı: {rawRef}");
+                continue;
+            }
+
             var normalizedRef = SqlScriptParser.NormalizeObjectName(rawRef);
 
-            // Alias ise gerçek tablo adını çöz
+            // Statement sınırlarını belirle: bu UPDATE'ten bir sonraki UPDATE'e (veya metin sonuna) kadar.
+            var statementEnd = i + 1 < updateMatches.Count ? updateMatches[i + 1].Index : masked.Length;
+            var statementText = masked.Substring(updateMatch.Index, statementEnd - updateMatch.Index);
+
+            // Alias ise SADECE bu statement'ın FROM/JOIN bloğundan gerçek tablo adını çöz.
+            // (Global alias haritası farklı statement'lardaki aynı adlı alias'ları karıştırabiliyordu.)
+            var aliasMap = BuildAliasMap(statementText);
             string resolvedTable;
+            string rawResolvedRef = rawRef;
             if (aliasMap.TryGetValue(normalizedRef, out var aliasResolved))
             {
-                resolvedTable = aliasResolved;
+                rawResolvedRef = aliasResolved;
+                resolvedTable = SqlScriptParser.NormalizeObjectName(aliasResolved);
                 Log($"  Alias çözümlendi: {normalizedRef} → {resolvedTable}");
+
+                // Alias temp tabloya çözümleniyorsa dahil etme.
+                if (IsTempOrVariableReference(aliasResolved))
+                {
+                    Log($"  Alias temp tabloya çözümlendi, atlandı: {normalizedRef} → {aliasResolved}");
+                    continue;
+                }
             }
             else
             {
@@ -157,7 +178,8 @@ public class UpdateStatementAnalyzer
     // -------------------------------------------------------------------------
 
     /// <summary>
-    /// FROM ve JOIN ifadelerinden alias → tablo adı haritası oluşturur.
+    /// FROM ve JOIN ifadelerinden alias → ham tablo referansı haritası oluşturur.
+    /// (İlk eşleşme kazanır: statement-local kullanımda UPDATE'in kendi FROM'u önceliklidir.)
     /// </summary>
     private static Dictionary<string, string> BuildAliasMap(string sql)
     {
@@ -165,13 +187,24 @@ public class UpdateStatementAnalyzer
         var matches = AliasRegex.Matches(sql);
         foreach (Match m in matches)
         {
-            var tableName = SqlScriptParser.NormalizeObjectName(m.Groups[1].Value.Trim());
+            var tableRef = m.Groups[1].Value.Trim();
             var alias = m.Groups[2].Value.Trim();
-            // alias SQL anahtar kelimesi değilse ekle
-            if (!IsSqlKeyword(alias))
-                map[alias] = tableName;
+            // alias SQL anahtar kelimesi değilse ve daha önce eklenmemişse ekle
+            if (!IsSqlKeyword(alias) && !map.ContainsKey(alias))
+                map[alias] = tableRef;
         }
         return map;
+    }
+
+    /// <summary>
+    /// Referansın temp tablo (#tmp, ##global) veya tablo değişkeni (@var) olup olmadığını kontrol eder.
+    /// </summary>
+    private static bool IsTempOrVariableReference(string reference)
+    {
+        var clean = reference.Replace("[", "").Replace("]", "").Trim();
+        // Çok parçalı adlarda son parçaya bak (örn. tempdb..#tmp)
+        var last = clean.Split('.')[^1].Trim();
+        return last.StartsWith("#") || last.StartsWith("@");
     }
 
     /// <summary>
