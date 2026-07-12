@@ -65,6 +65,16 @@ public class UpdateStatementAnalyzer
 
         Log($"\n=== Analiz başlıyor: {spName} ===");
 
+        // Hızlı ön-eleme: body'de hiç "UPDATE" ve dinamik SQL izi yoksa
+        // pahalı regex/strip/mask adımlarına hiç girme.
+        if (!spBody.Contains("UPDATE", StringComparison.OrdinalIgnoreCase)
+            && !spBody.Contains("sp_executesql", StringComparison.OrdinalIgnoreCase)
+            && !spBody.Contains("EXEC", StringComparison.OrdinalIgnoreCase))
+        {
+            Log("  UPDATE/EXEC yok, hızlı atlama.");
+            return result;
+        }
+
         // 1. Yorumları temizle (satır numarası bilgisi için orijinali sakla)
         var originalLines = spBody.Split('\n');
         var stripped = SqlScriptParser.StripComments(spBody);
@@ -245,20 +255,18 @@ public class UpdateStatementAnalyzer
     /// <summary>
     /// Verilen kelimenin bilinen bir SQL anahtar kelimesi olup olmadığını kontrol eder.
     /// </summary>
-    private static bool IsSqlKeyword(string word)
+    private static readonly HashSet<string> SqlKeywords = new(StringComparer.OrdinalIgnoreCase)
     {
-        var keywords = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-        {
-            "SELECT","FROM","WHERE","SET","ON","AS","AND","OR","NOT","IN","IS",
-            "NULL","JOIN","LEFT","RIGHT","INNER","OUTER","FULL","CROSS","HAVING",
-            "GROUP","ORDER","BY","INTO","VALUES","INSERT","UPDATE","DELETE","MERGE",
-            "WITH","TOP","DISTINCT","CASE","WHEN","THEN","ELSE","END","EXEC",
-            "EXECUTE","BEGIN","TRANSACTION","COMMIT","ROLLBACK","GO","DECLARE",
-            "PROCEDURE","PROC","FUNCTION","TRIGGER","VIEW","TABLE","INDEX","IF",
-            "EXISTS","BETWEEN","LIKE"
-        };
-        return keywords.Contains(word);
-    }
+        "SELECT","FROM","WHERE","SET","ON","AS","AND","OR","NOT","IN","IS",
+        "NULL","JOIN","LEFT","RIGHT","INNER","OUTER","FULL","CROSS","HAVING",
+        "GROUP","ORDER","BY","INTO","VALUES","INSERT","UPDATE","DELETE","MERGE",
+        "WITH","TOP","DISTINCT","CASE","WHEN","THEN","ELSE","END","EXEC",
+        "EXECUTE","BEGIN","TRANSACTION","COMMIT","ROLLBACK","GO","DECLARE",
+        "PROCEDURE","PROC","FUNCTION","TRIGGER","VIEW","TABLE","INDEX","IF",
+        "EXISTS","BETWEEN","LIKE"
+    };
+
+    private static bool IsSqlKeyword(string word) => SqlKeywords.Contains(word);
 
     private void Log(string message)
     {

@@ -99,6 +99,7 @@ public class DatabaseScanner
 
             // 3. Prefetch edilmiş definition'ları al, bir sonraki DB'yi indirmeye başla
             List<(string Schema, string SpName, string Definition)> spDefinitions;
+            var fetchStopwatch = System.Diagnostics.Stopwatch.StartNew();
             try
             {
                 spDefinitions = await prefetch!;
@@ -118,6 +119,8 @@ public class DatabaseScanner
             if (dbIdx + 1 < databases.Count)
                 prefetch = FetchAsync(databases[dbIdx + 1]);
 
+            fetchStopwatch.Stop();
+
             if (spDefinitions.Count == 0)
             {
                 ProgressReporter.Warning($"'{db}' içinde SP yok, atlanıyor.");
@@ -125,6 +128,7 @@ public class DatabaseScanner
             }
 
             // 4. Analizi tamamen CPU-bound paralel çalıştır
+            var analyzeStopwatch = System.Diagnostics.Stopwatch.StartNew();
             var dbResults = new System.Collections.Concurrent.ConcurrentBag<SpAnalysisResult>();
 
             var parallelOptions = new ParallelOptions
@@ -189,7 +193,10 @@ public class DatabaseScanner
 
             totalDbSp += dbSpCount;
             totalDbMissing += dbMissingCount;
+            analyzeStopwatch.Stop();
             dbStopwatch.Stop();
+            ProgressReporter.Info(
+                $"    ⮡ indirme: {fetchStopwatch.Elapsed.TotalSeconds:F1}sn, analiz: {analyzeStopwatch.Elapsed.TotalSeconds:F1}sn");
             ProgressReporter.DatabaseComplete(db, dbSpCount, dbMissingCount, dbStopwatch.Elapsed);
         }
 
