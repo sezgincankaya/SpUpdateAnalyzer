@@ -150,6 +150,24 @@ public class SqlServerReader
         return result;
     }
 
+    /// <summary>
+    /// Belirtilen veritabanındaki toplam SP sayısını döner.
+    /// </summary>
+    public async Task<int> GetStoredProcedureCountAsync(string database, CancellationToken ct = default)
+    {
+        const string sql = @"
+            SELECT COUNT(*)
+            FROM   sys.procedures p
+            WHERE  p.type = 'P'";
+
+        await using var conn = new SqlConnection(BuildConnectionString(database));
+        await conn.OpenAsync(ct);
+        await using var cmd = new SqlCommand(sql, conn);
+
+        var result = await cmd.ExecuteScalarAsync(ct);
+        return result is int count ? count : 0;
+    }
+
     // -------------------------------------------------------------------------
     // SP definition
     // -------------------------------------------------------------------------

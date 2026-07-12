@@ -143,4 +143,42 @@ END";
         var sorted = names.OrderBy(n => n, StringComparer.OrdinalIgnoreCase).ToList();
         Assert.Equal(sorted, names);
     }
+
+    // -------------------------------------------------------------------------
+    // 8. Null analyzer — ArgumentNullException fýrlatmalý
+    // -------------------------------------------------------------------------
+    [Fact]
+    public async Task AnalyzeAll_NullAnalyzer_ShouldThrowArgumentNull()
+    {
+        var sps = BuildSpSet(1);
+
+        await Assert.ThrowsAsync<ArgumentNullException>(
+            () => ParallelSpAnalyzer.AnalyzeAllAsync(null!, sps, 4));
+    }
+
+    // -------------------------------------------------------------------------
+    // 9. Null SP sözlüðü — ArgumentNullException fýrlatmalý
+    // -------------------------------------------------------------------------
+    [Fact]
+    public async Task AnalyzeAll_NullStoredProcedures_ShouldThrowArgumentNull()
+    {
+        var analyzer = CreateAnalyzer("Orders");
+
+        await Assert.ThrowsAsync<ArgumentNullException>(
+            () => ParallelSpAnalyzer.AnalyzeAllAsync(analyzer, null!, 4));
+    }
+
+    // -------------------------------------------------------------------------
+    // 10. Thread sayýsý SP sayýsýndan büyükse — sorunsuz çalýþmalý
+    // -------------------------------------------------------------------------
+    [Fact]
+    public async Task AnalyzeAll_ThreadCountGreaterThanSpCount_ShouldWork()
+    {
+        var sps = BuildSpSet(3);
+        var analyzer = CreateAnalyzer("Orders");
+
+        var results = await ParallelSpAnalyzer.AnalyzeAllAsync(analyzer, sps, 16);
+
+        Assert.Equal(3, results.Count);
+    }
 }
