@@ -58,25 +58,31 @@ public class DatabaseScanner
 
         ProgressReporter.Info($"Bulunan kullanıcı DB sayısı: {databases.Count}");
 
-        // DB başına SP sayılarını al ve başlangıçta özet göster
-        var dbOverview = new List<(string Database, int SpCount)>(databases.Count);
-        foreach (var db in databases)
+        // DB başına SP sayılarını PARALEL al ve başlangıçta özet göster
+        var countTasks = databases.Select(async db =>
         {
-            ct.ThrowIfCancellationRequested();
             try
             {
-                dbOverview.Add((db, await _reader.GetStoredProcedureCountAsync(db, ct)));
+                return (Database: db, SpCount: await _reader.GetStoredProcedureCountAsync(db, ct));
             }
             catch (Exception ex)
             {
                 ProgressReporter.Warning($"'{db}' SP sayısı alınamadı: {ex.Message}");
-                dbOverview.Add((db, 0));
+                return (Database: db, SpCount: 0);
             }
-        }
+        }).ToList();
+        var dbOverview = (await Task.WhenAll(countTasks)).ToList();
         ProgressReporter.Overview(dbOverview);
 
         int totalDbMissing = 0, totalDbSp = 0;
         var totalStopwatch = System.Diagnostics.Stopwatch.StartNew();
+
+        // Pipeline: bir DB analiz edilirken bir sonraki DB'nin definition'ları
+        // arka planda indirilir (I/O ile CPU işi örtüşür).
+        Task<List<(string Schema, string SpName, string Definition)>> FetchAsync(string database)
+            => _reader.GetAllSpDefinitionsAsync(database, ct);
+
+        var prefetch = databases.Count > 0 ? FetchAsync(databases[0]) : null;
 
         // 2. Her DB için
         for (var dbIdx = 0; dbIdx < databases.Count; dbIdx++)
@@ -91,17 +97,26 @@ public class DatabaseScanner
             var dbTotalSp = dbOverview[dbIdx].SpCount;
             var dbProcessedSp = 0;
 
-            // 3. Tüm SP definition'larını TEK sorguda çek (SP başına bağlantı açılmaz)
+            // 3. Prefetch edilmiş definition'ları al, bir sonraki DB'yi indirmeye başla
             List<(string Schema, string SpName, string Definition)> spDefinitions;
             try
             {
-                spDefinitions = await _reader.GetAllSpDefinitionsAsync(db, ct);
+                spDefinitions = await prefetch!;
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
             }
             catch (Exception ex)
             {
                 ProgressReporter.Error($"'{db}' SP definition'ları alınamadı: {ex.Message}");
+                if (dbIdx + 1 < databases.Count)
+                    prefetch = FetchAsync(databases[dbIdx + 1]);
                 continue;
             }
+
+            if (dbIdx + 1 < databases.Count)
+                prefetch = FetchAsync(databases[dbIdx + 1]);
 
             if (spDefinitions.Count == 0)
             {
