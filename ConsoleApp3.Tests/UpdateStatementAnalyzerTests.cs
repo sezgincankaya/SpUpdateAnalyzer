@@ -409,4 +409,188 @@ END";
         Assert.Contains("Amount", stmt.SetColumns, StringComparer.OrdinalIgnoreCase);
         Assert.Contains("UpdatedDate", stmt.SetColumns, StringComparer.OrdinalIgnoreCase);
     }
+
+    // -------------------------------------------------------------------------
+    // 22. Temp tabloya doğrudan UPDATE — dahil edilmemeli
+    // -------------------------------------------------------------------------
+    [Theory]
+    [InlineData("#tmpOrders")]
+    [InlineData("##globalTmpOrders")]
+    [InlineData("[#tmpOrders]")]
+    [InlineData("tempdb..#tmpOrders")]
+    public void TempTableUpdate_ShouldBeExcluded(string tempRef)
+    {
+        var sp = $@"
+CREATE PROCEDURE dbo.usp_TempUpdate AS BEGIN
+    UPDATE {tempRef}
+    SET Status = 1
+    WHERE Id = 1
+END";
+        var analyzer = CreateAnalyzer("Orders", "tmpOrders", "globalTmpOrders");
+        var result = analyzer.Analyze("usp_TempUpdate", sp);
+
+        Assert.Equal(0, result.TotalTargetUpdateCount);
+    }
+
+    // -------------------------------------------------------------------------
+    // 23. Tablo değişkenine UPDATE — dahil edilmemeli
+    // -------------------------------------------------------------------------
+    [Fact]
+    public void TableVariableUpdate_ShouldBeExcluded()
+    {
+        const string sp = @"
+CREATE PROCEDURE dbo.usp_TableVar AS BEGIN
+    DECLARE @Orders TABLE (Id INT, Status INT)
+    UPDATE @Orders
+    SET Status = 1
+END";
+        var analyzer = CreateAnalyzer("Orders");
+        var result = analyzer.Analyze("usp_TableVar", sp);
+
+        Assert.Equal(0, result.TotalTargetUpdateCount);
+    }
+
+    // -------------------------------------------------------------------------
+    // 24. Alias temp tabloya çözümleniyor — dahil edilmemeli
+    // -------------------------------------------------------------------------
+    [Fact]
+    public void AliasResolvingToTempTable_ShouldBeExcluded()
+    {
+        const string sp = @"
+CREATE PROCEDURE dbo.usp_TempAlias AS BEGIN
+    UPDATE a SET
+        a.Risk = 0
+    FROM #tmpRiskDetail a
+    WHERE a.RiskCode = '106'
+END";
+        var analyzer = CreateAnalyzer("Account", "tmpRiskDetail");
+        var result = analyzer.Analyze("usp_TempAlias", sp);
+
+        Assert.Equal(0, result.TotalTargetUpdateCount);
+    }
+
+    // -------------------------------------------------------------------------
+    // 25. Aynı alias farklı statement'larda farklı tablolara — karışmamalı
+    //     (global alias haritası hatası regresyon testi)
+    // -------------------------------------------------------------------------
+    [Fact]
+    public void SameAliasDifferentStatements_ShouldResolveLocally()
+    {
+        const string sp = @"
+CREATE PROCEDURE dbo.usp_SameAlias AS BEGIN
+    -- 'a' burada temp tabloya işaret ediyor
+    UPDATE a SET
+        a.Risk = 0
+    FROM #tmpRiskDetail a
+    WHERE a.RiskCode = '106'
+
+    -- 'a' burada başka bir SELECT'te gerçek tabloya işaret ediyor
+    SELECT 1
+    FROM COR.Account AS a WITH (NOLOCK)
+    WHERE a.AccountNumber = 1
+END";
+        var analyzer = CreateAnalyzer("Account");
+        var result = analyzer.Analyze("usp_SameAlias", sp);
+
+        // Temp tabloya yapılan UPDATE, Account'a yapılmış gibi raporlanmamalı
+        Assert.Equal(0, result.TotalTargetUpdateCount);
+    }
+
+    // -------------------------------------------------------------------------
+    // 26. Alias gerçek tabloya çözümleniyor, aynı SP'de temp tablolar da var
+    // -------------------------------------------------------------------------
+    [Fact]
+    public void AliasResolvingToRealTable_WithTempTablesAround_ShouldBeIncluded()
+    {
+        const string sp = @"
+CREATE PROCEDURE dbo.usp_MixedAlias AS BEGIN
+    UPDATE t SET
+        t.Status = 0
+    FROM #tmpSomething t
+
+    UPDATE o SET
+        o.Status = 1, o.UpdatedDate = GETDATE()
+    FROM dbo.Orders AS o
+    INNER JOIN #tmpSomething t ON t.Id = o.Id
+END";
+        var analyzer = CreateAnalyzer("Orders");
+        var result = analyzer.Analyze("usp_MixedAlias", sp);
+
+        var stmt = Assert.Single(result.UpdateStatements);
+        Assert.Equal("Orders", stmt.NormalizedTableName, StringComparer.OrdinalIgnoreCase);
+        Assert.Equal(0, result.MissingColumnCount);
+    }
+
+    // -------------------------------------------------------------------------
+    // 27. UPDATE TOP (n) tablo — tablo doğru yakalanmalı
+    // -------------------------------------------------------------------------
+    [Theory]
+    [InlineData("UPDATE TOP (10) dbo.Orders")]
+    [InlineData("UPDATE TOP(100) PERCENT dbo.Orders")]
+    public void UpdateTop_ShouldCaptureTable(string updateClause)
+    {
+        var sp = $@"
+CREATE PROCEDURE dbo.usp_Top AS BEGIN
+    {updateClause}
+    SET Status = 1
+    WHERE Id = 1
+END";
+        var analyzer = CreateAnalyzer("Orders");
+        var result = analyzer.Analyze("usp_Top", sp);
+
+        Assert.Equal(1, result.TotalTargetUpdateCount);
+    }
+
+    // -------------------------------------------------------------------------
+    // 28. MERGE ... WHEN MATCHED THEN UPDATE SET — yanlış pozitif üretmemeli
+    // -------------------------------------------------------------------------
+    [Fact]
+    public void MergeUpdateSet_ShouldNotProduceFalsePositive()
+    {
+        const string sp = @"
+CREATE PROCEDURE dbo.usp_Merge AS BEGIN
+    MERGE dbo.Orders AS target
+    USING dbo.Staging AS source ON target.Id = source.Id
+    WHEN MATCHED THEN UPDATE SET target.Status = source.Status;
+END";
+        var analyzer = CreateAnalyzer("Set", "Orders");
+        var result = analyzer.Analyze("usp_Merge", sp);
+
+        // 'SET' bir tablo adı gibi raporlanmamalı
+        Assert.DoesNotContain(result.UpdateStatements,
+            u => u.NormalizedTableName.Equals("SET", StringComparison.OrdinalIgnoreCase));
+    }
+
+    // -------------------------------------------------------------------------
+    // 29. UPDATE STATISTICS tablo — veri UPDATE'i değildir, dahil edilmemeli
+    // -------------------------------------------------------------------------
+    [Fact]
+    public void UpdateStatistics_ShouldBeIgnored()
+    {
+        const string sp = @"
+CREATE PROCEDURE dbo.usp_Stats AS BEGIN
+    UPDATE STATISTICS dbo.Orders
+END";
+        var analyzer = CreateAnalyzer("Orders", "Statistics");
+        var result = analyzer.Analyze("usp_Stats", sp);
+
+        Assert.Equal(0, result.TotalTargetUpdateCount);
+    }
+
+    // -------------------------------------------------------------------------
+    // 30. UPDATE(kolon) fonksiyonu (trigger'larda) — tablo UPDATE'i sayılmamalı
+    // -------------------------------------------------------------------------
+    [Fact]
+    public void UpdateFunctionInTrigger_ShouldNotMatchTargets()
+    {
+        const string sp = @"
+CREATE PROCEDURE dbo.usp_FnLike AS BEGIN
+    IF UPDATE(Status)
+        SELECT 1
+END";
+        var analyzer = CreateAnalyzer("Orders");
+        var result = analyzer.Analyze("usp_FnLike", sp);
+
+        Assert.Equal(0, result.TotalTargetUpdateCount);
+    }
 }

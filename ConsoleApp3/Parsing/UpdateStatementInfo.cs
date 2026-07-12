@@ -10,14 +10,15 @@ namespace ConsoleApp3.Parsing;
 /// </summary>
 public class UpdateStatementAnalyzer
 {
-    // UPDATE ifadesinin başlangıcını yakalar: UPDATE [alias_or_table]
-    // Temp tablo (#tmp) ve tablo değişkenleri (@var) de yakalanır ki bilinçli atlanabilsin.
+    // UPDATE ifadesinin başlangıcını yakalar: UPDATE [TOP (n)] [alias_or_table]
+    // Temp tablolar (#tmp, ##global), tablo değişkenleri (@var) ve
+    // tempdb..#tmp gibi çift-nokta gösterimleri de yakalanır ki bilinçli atlanabilsin.
     private const string UpdateKeywordPattern =
-        @"\bUPDATE\s+((?:\[[\w\s#@]+\]|[#@]?[\w]+)(?:\.(?:\[[\w\s#@]+\]|[#@]?[\w]+)){0,2})";
+        @"\bUPDATE\s+(?:TOP\s*\(\s*\d+\s*\)\s*(?:PERCENT\s+)?)?((?:\[[\w\s#@]+\]|(?:##?|@)?[\w]+)(?:\.{1,2}(?:\[[\w\s#@]+\]|(?:##?|@)?[\w]+)){0,2})";
 
     // FROM bloğu içinde alias tanımını yakalar: tablo_adı alias veya tablo_adı AS alias
     private const string AliasPattern =
-        @"(?:FROM|JOIN)\s+((?:\[[\w\s#@]+\]|[#@]?[\w]+)(?:\.(?:\[[\w\s#@]+\]|[#@]?[\w]+)){0,2})\s+(?:AS\s+)?([\w]+)";
+        @"(?:FROM|JOIN)\s+((?:\[[\w\s#@]+\]|(?:##?|@)?[\w]+)(?:\.{1,2}(?:\[[\w\s#@]+\]|(?:##?|@)?[\w]+)){0,2})\s+(?:AS\s+)?([\w]+)";
 
     // SET bloğunu yakalar (UPDATE...SET...WHERE/FROM/; arasındaki kısım)
     private const string SetBlockPattern =
@@ -106,6 +107,14 @@ public class UpdateStatementAnalyzer
             }
 
             var normalizedRef = SqlScriptParser.NormalizeObjectName(rawRef);
+
+            // MERGE ... WHEN MATCHED THEN UPDATE SET → "SET" tablo adı sanılmasın.
+            // UPDATE STATISTICS tablo → gerçek bir veri UPDATE'i değildir.
+            if (IsSqlKeyword(normalizedRef) || normalizedRef.Equals("STATISTICS", StringComparison.OrdinalIgnoreCase))
+            {
+                Log($"  SQL anahtar kelimesi / UPDATE STATISTICS, atlandı: {rawRef}");
+                continue;
+            }
 
             // Statement sınırlarını belirle: bu UPDATE'ten bir sonraki UPDATE'e (veya metin sonuna) kadar.
             var statementEnd = i + 1 < updateMatches.Count ? updateMatches[i + 1].Index : masked.Length;
