@@ -58,25 +58,31 @@ public class DatabaseScanner
 
         ProgressReporter.Info($"Bulunan kullanıcı DB sayısı: {databases.Count}");
 
-        // DB başına SP sayılarını al ve başlangıçta özet göster
-        var dbOverview = new List<(string Database, int SpCount)>(databases.Count);
-        foreach (var db in databases)
+        // DB başına SP sayılarını PARALEL al ve başlangıçta özet göster
+        var countTasks = databases.Select(async db =>
         {
-            ct.ThrowIfCancellationRequested();
             try
             {
-                dbOverview.Add((db, await _reader.GetStoredProcedureCountAsync(db, ct)));
+                return (Database: db, SpCount: await _reader.GetStoredProcedureCountAsync(db, ct));
             }
             catch (Exception ex)
             {
                 ProgressReporter.Warning($"'{db}' SP sayısı alınamadı: {ex.Message}");
-                dbOverview.Add((db, 0));
+                return (Database: db, SpCount: 0);
             }
-        }
+        }).ToList();
+        var dbOverview = (await Task.WhenAll(countTasks)).ToList();
         ProgressReporter.Overview(dbOverview);
 
         int totalDbMissing = 0, totalDbSp = 0;
         var totalStopwatch = System.Diagnostics.Stopwatch.StartNew();
+
+        // Pipeline: bir DB analiz edilirken bir sonraki DB'nin definition'ları
+        // arka planda indirilir (I/O ile CPU işi örtüşür).
+        Task<List<(string Schema, string SpName, string Definition)>> FetchAsync(string database)
+            => _reader.GetAllSpDefinitionsAsync(database, ct);
+
+        var prefetch = databases.Count > 0 ? FetchAsync(databases[0]) : null;
 
         // 2. Her DB için
         for (var dbIdx = 0; dbIdx < databases.Count; dbIdx++)
@@ -91,77 +97,52 @@ public class DatabaseScanner
             var dbTotalSp = dbOverview[dbIdx].SpCount;
             var dbProcessedSp = 0;
 
-            // 3. Şemaları al
-            List<string> schemas;
+            // 3. Prefetch edilmiş definition'ları al, bir sonraki DB'yi indirmeye başla
+            List<(string Schema, string SpName, string Definition)> spDefinitions;
+            var fetchStopwatch = System.Diagnostics.Stopwatch.StartNew();
             try
             {
-                schemas = await _reader.GetSchemasAsync(db, ct);
+                spDefinitions = await prefetch!;
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
             }
             catch (Exception ex)
             {
-                ProgressReporter.Error($"'{db}' şemaları alınamadı: {ex.Message}");
+                ProgressReporter.Error($"'{db}' SP definition'ları alınamadı: {ex.Message}");
+                if (dbIdx + 1 < databases.Count)
+                    prefetch = FetchAsync(databases[dbIdx + 1]);
                 continue;
             }
 
-            if (schemas.Count == 0)
+            if (dbIdx + 1 < databases.Count)
+                prefetch = FetchAsync(databases[dbIdx + 1]);
+
+            fetchStopwatch.Stop();
+
+            if (spDefinitions.Count == 0)
             {
-                ProgressReporter.Warning($"'{db}' içinde SP bulunan şema yok, atlanıyor.");
+                ProgressReporter.Warning($"'{db}' içinde SP yok, atlanıyor.");
                 continue;
             }
 
-            // 4. Her şema için
-            for (var schemaIdx = 0; schemaIdx < schemas.Count; schemaIdx++)
+            // 4. Analizi tamamen CPU-bound paralel çalıştır
+            var analyzeStopwatch = System.Diagnostics.Stopwatch.StartNew();
+            var dbResults = new System.Collections.Concurrent.ConcurrentBag<SpAnalysisResult>();
+
+            var parallelOptions = new ParallelOptions
             {
-                ct.ThrowIfCancellationRequested();
+                MaxDegreeOfParallelism = _maxDegreeOfParallelism,
+                CancellationToken = ct
+            };
 
-                var schema = schemas[schemaIdx];
-
-                // 5. SP listesini al
-                List<(string Schema, string SpName)> spList;
-                try
+            await Task.Run(() =>
+                Parallel.ForEach(spDefinitions, parallelOptions, sp =>
                 {
-                    spList = await _reader.GetStoredProcedureNamesAsync(db, schema, ct);
-                }
-                catch (Exception ex)
-                {
-                    ProgressReporter.Error($"'{db}.{schema}' SP listesi alınamadı: {ex.Message}");
-                    continue;
-                }
-
-                int schemaMissing = 0;
-
-                // 6. SP'leri paralel işle (thread sayısı kullanıcı tarafından belirlenir)
-                var schemaResults = new System.Collections.Concurrent.ConcurrentBag<SpAnalysisResult>();
-                var processedCount = 0;
-
-                var parallelOptions = new ParallelOptions
-                {
-                    MaxDegreeOfParallelism = _maxDegreeOfParallelism,
-                    CancellationToken = ct
-                };
-
-                await Parallel.ForEachAsync(spList, parallelOptions, async (sp, token) =>
-                {
-                    var (spSchema, spName) = sp;
-                    Interlocked.Increment(ref processedCount);
+                    var (spSchema, spName, definition) = sp;
                     var currentDb = Interlocked.Increment(ref dbProcessedSp);
                     ProgressReporter.Progress(currentDb, dbTotalSp);
-
-                    // Definition'ı çek
-                    string? definition;
-                    try
-                    {
-                        definition = await _reader.GetSpDefinitionAsync(db, spSchema, spName, token);
-                    }
-                    catch (OperationCanceledException)
-                    {
-                        throw;
-                    }
-                    catch (Exception ex)
-                    {
-                        ProgressReporter.Error($"'{spName}' definition alınamadı: {ex.Message}");
-                        return;
-                    }
 
                     if (string.IsNullOrWhiteSpace(definition))
                     {
@@ -176,7 +157,9 @@ public class DatabaseScanner
                     {
                         // Tam niteliklendirme: DB.Schema.SpName
                         var fullName = $"{db}.{spSchema}.{spName}";
-                        result = _analyzer.Analyze(fullName, definition);
+                        // SP'nin DB bağlamı geçilir: DB niteliği olmayan referanslar
+                        // (örn. COR.Account) bu DB ile nitelenip hedeflerle karşılaştırılır.
+                        result = _analyzer.Analyze(fullName, definition, db);
 
                         // DB ve şema bilgisini result'a ekle (raporlama için)
                         result.DatabaseName = db;
@@ -188,27 +171,34 @@ public class DatabaseScanner
                         return;
                     }
 
-                    ProgressReporter.SpResult(
-                        spName,
-                        result.MissingColumnCount > 0,
-                        result.HasDynamicSqlWarning);
+                    // SP bazlı detaylar sadece verbose modda konsola yazılır;
+                    // eksik kolon / dinamik SQL detayları Excel raporunda yer alır.
+                    if (_verbose)
+                    {
+                        ProgressReporter.SpResult(
+                            spName,
+                            result.MissingColumnCount > 0,
+                            result.HasDynamicSqlWarning);
+                    }
 
-                    schemaResults.Add(result);
-                });
+                    dbResults.Add(result);
+                }), ct);
 
-                foreach (var result in schemaResults.OrderBy(r => r.SpName, StringComparer.OrdinalIgnoreCase))
-                {
-                    allResults.Add(result);
-                    schemaMissing += result.MissingColumnCount;
-                    dbSpCount++;
-                }
-
-                dbMissingCount += schemaMissing;
+            foreach (var result in dbResults
+                         .OrderBy(r => r.SchemaName, StringComparer.OrdinalIgnoreCase)
+                         .ThenBy(r => r.SpName, StringComparer.OrdinalIgnoreCase))
+            {
+                allResults.Add(result);
+                dbMissingCount += result.MissingColumnCount;
+                dbSpCount++;
             }
 
             totalDbSp += dbSpCount;
             totalDbMissing += dbMissingCount;
+            analyzeStopwatch.Stop();
             dbStopwatch.Stop();
+            ProgressReporter.Info(
+                $"    ⮡ indirme: {fetchStopwatch.Elapsed.TotalSeconds:F1}sn, analiz: {analyzeStopwatch.Elapsed.TotalSeconds:F1}sn");
             ProgressReporter.DatabaseComplete(db, dbSpCount, dbMissingCount, dbStopwatch.Elapsed);
         }
 

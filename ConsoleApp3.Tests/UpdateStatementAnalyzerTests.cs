@@ -409,4 +409,617 @@ END";
         Assert.Contains("Amount", stmt.SetColumns, StringComparer.OrdinalIgnoreCase);
         Assert.Contains("UpdatedDate", stmt.SetColumns, StringComparer.OrdinalIgnoreCase);
     }
+
+    // -------------------------------------------------------------------------
+    // 22. Temp tabloya doğrudan UPDATE — dahil edilmemeli
+    // -------------------------------------------------------------------------
+    [Theory]
+    [InlineData("#tmpOrders")]
+    [InlineData("##globalTmpOrders")]
+    [InlineData("[#tmpOrders]")]
+    [InlineData("tempdb..#tmpOrders")]
+    public void TempTableUpdate_ShouldBeExcluded(string tempRef)
+    {
+        var sp = $@"
+CREATE PROCEDURE dbo.usp_TempUpdate AS BEGIN
+    UPDATE {tempRef}
+    SET Status = 1
+    WHERE Id = 1
+END";
+        var analyzer = CreateAnalyzer("Orders", "tmpOrders", "globalTmpOrders");
+        var result = analyzer.Analyze("usp_TempUpdate", sp);
+
+        Assert.Equal(0, result.TotalTargetUpdateCount);
+    }
+
+    // -------------------------------------------------------------------------
+    // 23. Tablo değişkenine UPDATE — dahil edilmemeli
+    // -------------------------------------------------------------------------
+    [Fact]
+    public void TableVariableUpdate_ShouldBeExcluded()
+    {
+        const string sp = @"
+CREATE PROCEDURE dbo.usp_TableVar AS BEGIN
+    DECLARE @Orders TABLE (Id INT, Status INT)
+    UPDATE @Orders
+    SET Status = 1
+END";
+        var analyzer = CreateAnalyzer("Orders");
+        var result = analyzer.Analyze("usp_TableVar", sp);
+
+        Assert.Equal(0, result.TotalTargetUpdateCount);
+    }
+
+    // -------------------------------------------------------------------------
+    // 24. Alias temp tabloya çözümleniyor — dahil edilmemeli
+    // -------------------------------------------------------------------------
+    [Fact]
+    public void AliasResolvingToTempTable_ShouldBeExcluded()
+    {
+        const string sp = @"
+CREATE PROCEDURE dbo.usp_TempAlias AS BEGIN
+    UPDATE a SET
+        a.Risk = 0
+    FROM #tmpRiskDetail a
+    WHERE a.RiskCode = '106'
+END";
+        var analyzer = CreateAnalyzer("Account", "tmpRiskDetail");
+        var result = analyzer.Analyze("usp_TempAlias", sp);
+
+        Assert.Equal(0, result.TotalTargetUpdateCount);
+    }
+
+    // -------------------------------------------------------------------------
+    // 25. Aynı alias farklı statement'larda farklı tablolara — karışmamalı
+    //     (global alias haritası hatası regresyon testi)
+    // -------------------------------------------------------------------------
+    [Fact]
+    public void SameAliasDifferentStatements_ShouldResolveLocally()
+    {
+        const string sp = @"
+CREATE PROCEDURE dbo.usp_SameAlias AS BEGIN
+    -- 'a' burada temp tabloya işaret ediyor
+    UPDATE a SET
+        a.Risk = 0
+    FROM #tmpRiskDetail a
+    WHERE a.RiskCode = '106'
+
+    -- 'a' burada başka bir SELECT'te gerçek tabloya işaret ediyor
+    SELECT 1
+    FROM COR.Account AS a WITH (NOLOCK)
+    WHERE a.AccountNumber = 1
+END";
+        var analyzer = CreateAnalyzer("Account");
+        var result = analyzer.Analyze("usp_SameAlias", sp);
+
+        // Temp tabloya yapılan UPDATE, Account'a yapılmış gibi raporlanmamalı
+        Assert.Equal(0, result.TotalTargetUpdateCount);
+    }
+
+    // -------------------------------------------------------------------------
+    // 26. Alias gerçek tabloya çözümleniyor, aynı SP'de temp tablolar da var
+    // -------------------------------------------------------------------------
+    [Fact]
+    public void AliasResolvingToRealTable_WithTempTablesAround_ShouldBeIncluded()
+    {
+        const string sp = @"
+CREATE PROCEDURE dbo.usp_MixedAlias AS BEGIN
+    UPDATE t SET
+        t.Status = 0
+    FROM #tmpSomething t
+
+    UPDATE o SET
+        o.Status = 1, o.UpdatedDate = GETDATE()
+    FROM dbo.Orders AS o
+    INNER JOIN #tmpSomething t ON t.Id = o.Id
+END";
+        var analyzer = CreateAnalyzer("Orders");
+        var result = analyzer.Analyze("usp_MixedAlias", sp);
+
+        var stmt = Assert.Single(result.UpdateStatements);
+        Assert.Equal("Orders", stmt.NormalizedTableName, StringComparer.OrdinalIgnoreCase);
+        Assert.Equal(0, result.MissingColumnCount);
+    }
+
+    // -------------------------------------------------------------------------
+    // 27. UPDATE TOP (n) tablo — tablo doğru yakalanmalı
+    // -------------------------------------------------------------------------
+    [Theory]
+    [InlineData("UPDATE TOP (10) dbo.Orders")]
+    [InlineData("UPDATE TOP(100) PERCENT dbo.Orders")]
+    public void UpdateTop_ShouldCaptureTable(string updateClause)
+    {
+        var sp = $@"
+CREATE PROCEDURE dbo.usp_Top AS BEGIN
+    {updateClause}
+    SET Status = 1
+    WHERE Id = 1
+END";
+        var analyzer = CreateAnalyzer("Orders");
+        var result = analyzer.Analyze("usp_Top", sp);
+
+        Assert.Equal(1, result.TotalTargetUpdateCount);
+    }
+
+    // -------------------------------------------------------------------------
+    // 28. MERGE ... WHEN MATCHED THEN UPDATE SET — yanlış pozitif üretmemeli
+    // -------------------------------------------------------------------------
+    [Fact]
+    public void MergeUpdateSet_ShouldNotProduceFalsePositive()
+    {
+        const string sp = @"
+CREATE PROCEDURE dbo.usp_Merge AS BEGIN
+    MERGE dbo.Orders AS target
+    USING dbo.Staging AS source ON target.Id = source.Id
+    WHEN MATCHED THEN UPDATE SET target.Status = source.Status;
+END";
+        var analyzer = CreateAnalyzer("Set", "Orders");
+        var result = analyzer.Analyze("usp_Merge", sp);
+
+        // 'SET' bir tablo adı gibi raporlanmamalı
+        Assert.DoesNotContain(result.UpdateStatements,
+            u => u.NormalizedTableName.Equals("SET", StringComparison.OrdinalIgnoreCase));
+    }
+
+    // -------------------------------------------------------------------------
+    // 29. UPDATE STATISTICS tablo — veri UPDATE'i değildir, dahil edilmemeli
+    // -------------------------------------------------------------------------
+    [Fact]
+    public void UpdateStatistics_ShouldBeIgnored()
+    {
+        const string sp = @"
+CREATE PROCEDURE dbo.usp_Stats AS BEGIN
+    UPDATE STATISTICS dbo.Orders
+END";
+        var analyzer = CreateAnalyzer("Orders", "Statistics");
+        var result = analyzer.Analyze("usp_Stats", sp);
+
+        Assert.Equal(0, result.TotalTargetUpdateCount);
+    }
+
+    // -------------------------------------------------------------------------
+    // 30. UPDATE(kolon) fonksiyonu (trigger'larda) — tablo UPDATE'i sayılmamalı
+    // -------------------------------------------------------------------------
+    [Fact]
+    public void UpdateFunctionInTrigger_ShouldNotMatchTargets()
+    {
+        const string sp = @"
+CREATE PROCEDURE dbo.usp_FnLike AS BEGIN
+    IF UPDATE(Status)
+        SELECT 1
+END";
+        var analyzer = CreateAnalyzer("Orders");
+        var result = analyzer.Analyze("usp_FnLike", sp);
+
+        Assert.Equal(0, result.TotalTargetUpdateCount);
+    }
+
+    // -------------------------------------------------------------------------
+    // 31. Schema/DB farklı ama tablo adı aynı → EŞLEŞMEMELİ
+    //     (BOADWH.LGD.Account vs BOA.COR.Account regresyon testi)
+    // -------------------------------------------------------------------------
+    [Fact]
+    public void SameTableNameDifferentSchema_ShouldNotMatch()
+    {
+        const string sp = @"
+CREATE PROCEDURE dbo.usp_LgdAccount AS BEGIN
+    UPDATE lgd
+    SET lgd.ClosureDate = lgd.DefaultDate
+    FROM BOADWH.LGD.Account lgd
+    WHERE lgd.ClosureDate < lgd.DefaultDate
+    AND ImportSource = 1
+END";
+        var analyzer = CreateAnalyzer("BOA.COR.Account");
+        var result = analyzer.Analyze("usp_LgdAccount", sp);
+
+        Assert.Equal(0, result.TotalTargetUpdateCount);
+    }
+
+    // -------------------------------------------------------------------------
+    // 32. Tam nitelikli hedef ↔ tam nitelikli referans → eşleşmeli
+    // -------------------------------------------------------------------------
+    [Theory]
+    [InlineData("UPDATE BOA.COR.Account")]
+    [InlineData("UPDATE [BOA].[COR].[Account]")]
+    [InlineData("UPDATE COR.Account")]
+    [InlineData("UPDATE [COR].[Account]")]
+    [InlineData("UPDATE Account")]
+    [InlineData("UPDATE [Account]")]
+    [InlineData("UPDATE BOA..Account")]
+    public void QualifiedTarget_MatchingReferences_ShouldMatch(string updateClause)
+    {
+        var sp = $@"
+CREATE PROCEDURE dbo.usp_Acc AS BEGIN
+    {updateClause}
+    SET Status = 1
+    WHERE Id = 1
+END";
+        var analyzer = CreateAnalyzer("BOA.COR.Account");
+        var result = analyzer.Analyze("usp_Acc", sp);
+
+        Assert.Equal(1, result.TotalTargetUpdateCount);
+    }
+
+    // -------------------------------------------------------------------------
+    // 33. Tam nitelikli hedef ↔ farklı schema/db referansları → EŞLEŞMEMELİ
+    // -------------------------------------------------------------------------
+    [Theory]
+    [InlineData("UPDATE BOADWH.LGD.Account")]
+    [InlineData("UPDATE [BOADWH].[LGD].[Account]")]
+    [InlineData("UPDATE LGD.Account")]
+    [InlineData("UPDATE OtherDb.COR.Account")]
+    public void QualifiedTarget_DifferentSchemaOrDb_ShouldNotMatch(string updateClause)
+    {
+        var sp = $@"
+CREATE PROCEDURE dbo.usp_AccOther AS BEGIN
+    {updateClause}
+    SET Status = 1
+    WHERE Id = 1
+END";
+        var analyzer = CreateAnalyzer("BOA.COR.Account");
+        var result = analyzer.Analyze("usp_AccOther", sp);
+
+        Assert.Equal(0, result.TotalTargetUpdateCount);
+    }
+
+    // -------------------------------------------------------------------------
+    // 34. Alias, schema'sı farklı tabloya çözümleniyor → EŞLEŞMEMELİ
+    // -------------------------------------------------------------------------
+    [Fact]
+    public void AliasResolvingToDifferentSchemaTable_ShouldNotMatch()
+    {
+        const string sp = @"
+CREATE PROCEDURE dbo.usp_AliasSchema AS BEGIN
+    UPDATE a SET
+        a.Status = 1
+    FROM [BOADWH].[LGD].[Account] AS a
+    WHERE a.Id = 1
+END";
+        var analyzer = CreateAnalyzer("BOA.COR.Account");
+        var result = analyzer.Analyze("usp_AliasSchema", sp);
+
+        Assert.Equal(0, result.TotalTargetUpdateCount);
+    }
+
+    // -------------------------------------------------------------------------
+    // 35. Alias, doğru schema'lı tabloya çözümleniyor → eşleşmeli
+    //     ve rapor edilen ad, hedef listesindeki tam ad olmalı
+    // -------------------------------------------------------------------------
+    [Fact]
+    public void AliasResolvingToMatchingSchemaTable_ShouldMatch()
+    {
+        const string sp = @"
+CREATE PROCEDURE dbo.usp_AliasSchemaOk AS BEGIN
+    UPDATE a SET
+        a.Status = 1, a.UpdatedDate = GETDATE()
+    FROM COR.Account AS a WITH (NOLOCK)
+    WHERE a.Id = 1
+END";
+        var analyzer = CreateAnalyzer("BOA.COR.Account");
+        var result = analyzer.Analyze("usp_AliasSchemaOk", sp);
+
+        var stmt = Assert.Single(result.UpdateStatements);
+        Assert.Equal("BOA.COR.Account", stmt.NormalizedTableName);
+        Assert.Equal(0, result.MissingColumnCount);
+    }
+
+    // -------------------------------------------------------------------------
+    // 36. Kısa hedef (base ad) verilirse tüm schema'larla eşleşebilmeli
+    // -------------------------------------------------------------------------
+    [Fact]
+    public void BareTargetName_ShouldMatchAnySchema()
+    {
+        const string sp = @"
+CREATE PROCEDURE dbo.usp_BareTarget AS BEGIN
+    UPDATE BOADWH.LGD.Account
+    SET Status = 1
+    WHERE Id = 1
+END";
+        var analyzer = CreateAnalyzer("Account");
+        var result = analyzer.Analyze("usp_BareTarget", sp);
+
+        Assert.Equal(1, result.TotalTargetUpdateCount);
+    }
+
+    // -------------------------------------------------------------------------
+    // 37. Köşeli parantezli / boşluklu hedef tanımı normalize edilmeli
+    // -------------------------------------------------------------------------
+    [Theory]
+    [InlineData("[BOA].[COR].[Account]")]
+    [InlineData(" BOA . COR . Account ")]
+    public void BracketedOrSpacedTargetDefinition_ShouldNormalize(string target)
+    {
+        const string sp = @"
+CREATE PROCEDURE dbo.usp_NormTarget AS BEGIN
+    UPDATE BOA.COR.Account
+    SET Status = 1
+    WHERE Id = 1
+END";
+        var analyzer = CreateAnalyzer(target);
+        var result = analyzer.Analyze("usp_NormTarget", sp);
+
+        Assert.Equal(1, result.TotalTargetUpdateCount);
+    }
+
+    // -------------------------------------------------------------------------
+    // 38. DB bağlamı: SP hedef DB'de (BOA) → DB niteliği olmayan referans eşleşmeli
+    // -------------------------------------------------------------------------
+    [Theory]
+    [InlineData("UPDATE COR.Account")]
+    [InlineData("UPDATE [COR].Account")]
+    [InlineData("UPDATE COR.[Account]")]
+    [InlineData("UPDATE [COR].[Account]")]
+    [InlineData("UPDATE Account")]
+    public void DbContextMatchesTarget_UnqualifiedRef_ShouldMatch(string updateClause)
+    {
+        var sp = $@"
+CREATE PROCEDURE dbo.usp_DbCtx AS BEGIN
+    {updateClause}
+    SET Status = 1
+    WHERE Id = 1
+END";
+        var analyzer = CreateAnalyzer("BOA.COR.Account");
+        var result = analyzer.Analyze("usp_DbCtx", sp, currentDatabase: "BOA");
+
+        Assert.Equal(1, result.TotalTargetUpdateCount);
+    }
+
+    // -------------------------------------------------------------------------
+    // 39. DB bağlamı: SP FARKLI DB'de → DB niteliği olmayan referans EŞLEŞMEMELİ
+    //     (BOADWH içindeki "COR.Account" aslında BOADWH.COR.Account'tur)
+    // -------------------------------------------------------------------------
+    [Theory]
+    [InlineData("UPDATE COR.Account")]
+    [InlineData("UPDATE [COR].[Account]")]
+    [InlineData("UPDATE Account")]
+    public void DbContextDiffersFromTarget_UnqualifiedRef_ShouldNotMatch(string updateClause)
+    {
+        var sp = $@"
+CREATE PROCEDURE dbo.usp_DbCtxOther AS BEGIN
+    {updateClause}
+    SET Status = 1
+    WHERE Id = 1
+END";
+        var analyzer = CreateAnalyzer("BOA.COR.Account");
+        var result = analyzer.Analyze("usp_DbCtxOther", sp, currentDatabase: "BOADWH");
+
+        Assert.Equal(0, result.TotalTargetUpdateCount);
+    }
+
+    // -------------------------------------------------------------------------
+    // 40. DB bağlamı: farklı DB'deki SP tam nitelikli BOA.COR.Account yazarsa → eşleşmeli
+    // -------------------------------------------------------------------------
+    [Fact]
+    public void DbContextDiffers_FullyQualifiedRef_ShouldStillMatch()
+    {
+        const string sp = @"
+CREATE PROCEDURE dbo.usp_CrossDb AS BEGIN
+    UPDATE BOA.COR.Account
+    SET Status = 1, UpdatedDate = GETDATE()
+    WHERE Id = 1
+END";
+        var analyzer = CreateAnalyzer("BOA.COR.Account");
+        var result = analyzer.Analyze("usp_CrossDb", sp, currentDatabase: "BOADWH");
+
+        Assert.Equal(1, result.TotalTargetUpdateCount);
+        Assert.Equal(0, result.MissingColumnCount);
+    }
+
+    // -------------------------------------------------------------------------
+    // 41. DB bağlamı verilmezse eski davranış korunur (geriye uyumluluk)
+    // -------------------------------------------------------------------------
+    [Fact]
+    public void NoDbContext_UnqualifiedRef_ShouldMatch()
+    {
+        const string sp = @"
+CREATE PROCEDURE dbo.usp_NoCtx AS BEGIN
+    UPDATE COR.Account
+    SET Status = 1
+    WHERE Id = 1
+END";
+        var analyzer = CreateAnalyzer("BOA.COR.Account");
+        var result = analyzer.Analyze("usp_NoCtx", sp);
+
+        Assert.Equal(1, result.TotalTargetUpdateCount);
+    }
+
+    // -------------------------------------------------------------------------
+    // 42. Nokta etrafında boşluklu referanslar (geçerli T-SQL) yakalanmalı
+    // -------------------------------------------------------------------------
+    [Theory]
+    [InlineData("UPDATE BOA . COR . Account")]
+    [InlineData("UPDATE [BOA] . [COR] . [Account]")]
+    public void SpacedDotsInReference_ShouldMatch(string updateClause)
+    {
+        var sp = $@"
+CREATE PROCEDURE dbo.usp_SpacedDots AS BEGIN
+    {updateClause}
+    SET Status = 1
+    WHERE Id = 1
+END";
+        var analyzer = CreateAnalyzer("BOA.COR.Account");
+        var result = analyzer.Analyze("usp_SpacedDots", sp);
+
+        Assert.Equal(1, result.TotalTargetUpdateCount);
+    }
+
+    // -------------------------------------------------------------------------
+    // 43. 4 parçalı (linked server) referans — server parçası yok sayılıp eşleşmeli
+    // -------------------------------------------------------------------------
+    [Fact]
+    public void FourPartLinkedServerReference_ShouldMatchIgnoringServer()
+    {
+        const string sp = @"
+CREATE PROCEDURE dbo.usp_LinkedSrv AS BEGIN
+    UPDATE srvkkdb.BOA.COR.Account
+    SET Status = 1
+    WHERE Id = 1
+END";
+        var analyzer = CreateAnalyzer("BOA.COR.Account");
+        var result = analyzer.Analyze("usp_LinkedSrv", sp);
+
+        Assert.Equal(1, result.TotalTargetUpdateCount);
+    }
+
+    // -------------------------------------------------------------------------
+    // 44. 4 parçalı referans farklı DB'ye işaret ediyorsa → eşleşmemeli
+    // -------------------------------------------------------------------------
+    [Fact]
+    public void FourPartReference_DifferentDb_ShouldNotMatch()
+    {
+        const string sp = @"
+CREATE PROCEDURE dbo.usp_LinkedSrvOther AS BEGIN
+    UPDATE srvkkdb.kredikuveyt.dbo.Account
+    SET Status = 1
+    WHERE Id = 1
+END";
+        var analyzer = CreateAnalyzer("BOA.COR.Account");
+        var result = analyzer.Analyze("usp_LinkedSrvOther", sp);
+
+        Assert.Equal(0, result.TotalTargetUpdateCount);
+    }
+
+    // -------------------------------------------------------------------------
+    // 45. Çift tırnaklı tanımlayıcılar (QUOTED_IDENTIFIER ON) eşleşmeli
+    // -------------------------------------------------------------------------
+    [Fact]
+    public void DoubleQuotedIdentifiers_ShouldMatch()
+    {
+        const string sp = @"
+CREATE PROCEDURE dbo.usp_Quoted AS BEGIN
+    UPDATE ""COR"".""Account""
+    SET Status = 1
+    WHERE Id = 1
+END";
+        var analyzer = CreateAnalyzer("BOA.COR.Account");
+        var result = analyzer.Analyze("usp_Quoted", sp, currentDatabase: "BOA");
+
+        Assert.Equal(1, result.TotalTargetUpdateCount);
+    }
+
+    // -------------------------------------------------------------------------
+    // 46. DB bağlamı + alias: farklı DB'deki SP'de alias'lı COR.Account → eşleşmemeli
+    // -------------------------------------------------------------------------
+    [Fact]
+    public void DbContext_AliasedUnqualifiedRef_InOtherDb_ShouldNotMatch()
+    {
+        const string sp = @"
+CREATE PROCEDURE dbo.usp_AliasCtx AS BEGIN
+    UPDATE a SET
+        a.Status = 1
+    FROM COR.Account AS a WITH (NOLOCK)
+    WHERE a.Id = 1
+END";
+        var analyzer = CreateAnalyzer("BOA.COR.Account");
+        var result = analyzer.Analyze("usp_AliasCtx", sp, currentDatabase: "BOADWH");
+
+        Assert.Equal(0, result.TotalTargetUpdateCount);
+    }
+
+    // -------------------------------------------------------------------------
+    // 47. SET içinde subquery (FROM/WHERE içeren) — sonraki kolonlar kaçmamalı
+    //     (CLT.tsk_UsableAmount regresyon testi: UpdateSystemDate raporlanmıştı)
+    // -------------------------------------------------------------------------
+    [Fact]
+    public void SetWithSubquery_ColumnsAfterSubquery_ShouldBeDetected()
+    {
+        const string sp = @"
+CREATE PROCEDURE CLT.tsk_Usable AS BEGIN
+    UPDATE C SET
+        C.UsableAmountUSD = ISNULL(
+            ( SELECT SUM(d.InstallmentAmount)
+              FROM CLT.DebtEndorsementDetail AS d WITH(NOLOCK)
+              WHERE d.CollateralId = c.CollateralId AND
+                    d.IsActive = 1
+              GROUP BY d.CollateralId ), 0),
+        C.UpdateSystemDate = GetDate()
+    FROM CLT.Collateral C
+    INNER JOIN CLT.DebtEndorsement d WITH(NOLOCK) ON d.CollateralId = C.CollateralId
+    WHERE C.State NOT IN ( 2,5 )
+END";
+        var analyzer = CreateAnalyzer("Collateral");
+        var result = analyzer.Analyze("tsk_Usable", sp);
+
+        var stmt = Assert.Single(result.UpdateStatements);
+        Assert.Contains("UsableAmountUSD", stmt.SetColumns, StringComparer.OrdinalIgnoreCase);
+        Assert.Contains("UpdateSystemDate", stmt.SetColumns, StringComparer.OrdinalIgnoreCase);
+        Assert.Equal(0, result.MissingColumnCount);
+    }
+
+    // -------------------------------------------------------------------------
+    // 48. SET içinde CASE ve subquery karışımı — subquery'deki '=' karşılaştırmaları
+    //     kolon sanılmamalı
+    // -------------------------------------------------------------------------
+    [Fact]
+    public void SetWithCaseAndSubquery_ComparisonsInside_ShouldNotBeColumns()
+    {
+        const string sp = @"
+CREATE PROCEDURE dbo.usp_CaseSub AS BEGIN
+    UPDATE C SET
+        C.UsableAmountUSD = (CASE
+                                WHEN C.FEC = 0 THEN C.CollateralAmount / @Rate
+                                ELSE C.CollateralAmount * fx.Parity
+                             END),
+        C.UpdateSystemDate = GetDate()
+    FROM CLT.Collateral C
+    LEFT JOIN @FxRate fx ON c.FEC = fx.FEC
+    WHERE C.State NOT IN ( 2,5 )
+END";
+        var analyzer = CreateAnalyzer("Collateral");
+        var result = analyzer.Analyze("usp_CaseSub", sp);
+
+        var stmt = Assert.Single(result.UpdateStatements);
+        // Sadece gerçek atamalar kolon olmalı
+        Assert.Equal(2, stmt.SetColumns.Count);
+        Assert.Contains("UsableAmountUSD", stmt.SetColumns, StringComparer.OrdinalIgnoreCase);
+        Assert.Contains("UpdateSystemDate", stmt.SetColumns, StringComparer.OrdinalIgnoreCase);
+        // CASE içindeki FEC = 0 karşılaştırması kolon sanılmamalı
+        Assert.DoesNotContain("FEC", stmt.SetColumns, StringComparer.OrdinalIgnoreCase);
+        Assert.Equal(0, result.MissingColumnCount);
+    }
+
+    // -------------------------------------------------------------------------
+    // 49. Subquery FROM'undan SONRA update kolonu yoksa yine eksik raporlanmalı
+    //     (yanlış negatife düşmediğimizi doğrula)
+    // -------------------------------------------------------------------------
+    [Fact]
+    public void SetWithSubquery_NoUpdateColumn_ShouldStillFlag()
+    {
+        const string sp = @"
+CREATE PROCEDURE dbo.usp_SubNoUpd AS BEGIN
+    UPDATE C SET
+        C.Amount = ISNULL(
+            ( SELECT SUM(d.Amount)
+              FROM dbo.Detail AS d
+              WHERE d.Id = c.Id ), 0)
+    FROM dbo.Orders C
+    WHERE C.State = 1
+END";
+        var analyzer = CreateAnalyzer("Orders");
+        var result = analyzer.Analyze("usp_SubNoUpd", sp);
+
+        Assert.Equal(1, result.TotalTargetUpdateCount);
+        Assert.True(result.MissingColumnCount > 0);
+    }
+
+    // -------------------------------------------------------------------------
+    // 50. Noktalı virgülle biten SET bloğu doğru sınırlanmalı
+    // -------------------------------------------------------------------------
+    [Fact]
+    public void SetBlockEndingWithSemicolon_ShouldBeBounded()
+    {
+        const string sp = @"
+CREATE PROCEDURE dbo.usp_Semi AS BEGIN
+    UPDATE dbo.Orders
+    SET Status = 1, UpdatedDate = GETDATE();
+    SELECT Amount = 5 FROM dbo.Other
+END";
+        var analyzer = CreateAnalyzer("Orders");
+        var result = analyzer.Analyze("usp_Semi", sp);
+
+        var stmt = Assert.Single(result.UpdateStatements);
+        Assert.Equal(2, stmt.SetColumns.Count);
+        Assert.DoesNotContain("Amount", stmt.SetColumns, StringComparer.OrdinalIgnoreCase);
+        Assert.Equal(0, result.MissingColumnCount);
+    }
 }
