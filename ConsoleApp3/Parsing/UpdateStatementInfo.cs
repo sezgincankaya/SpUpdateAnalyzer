@@ -10,23 +10,26 @@ namespace ConsoleApp3.Parsing;
 /// </summary>
 public class UpdateStatementAnalyzer
 {
+    // Tek bir ad parçası: [köşeli], "çift tırnaklı" veya düz ad (temp/değişken önekleriyle)
+    private const string NamePartPattern =
+        @"(?:\[[\w\s#@]+\]|""[\w\s#@]+""|(?:##?|@)?[\w]+)";
+
+    // Parça ayırıcı: nokta(lar), etrafında boşluk olabilir (BOA . COR . Account geçerlidir)
+    private const string SeparatorPattern = @"\s*\.(?:\s*\.)?\s*";
+
     // UPDATE ifadesinin başlangıcını yakalar: UPDATE [TOP (n)] [alias_or_table]
-    // Temp tablolar (#tmp, ##global), tablo değişkenleri (@var) ve
-    // tempdb..#tmp gibi çift-nokta gösterimleri de yakalanır ki bilinçli atlanabilsin.
+    // Temp tablolar (#tmp, ##global), tablo değişkenleri (@var),
+    // tempdb..#tmp çift-nokta gösterimleri ve 4 parçalı (linked server) adlar da yakalanır.
     private const string UpdateKeywordPattern =
-        @"\bUPDATE\s+(?:TOP\s*\(\s*\d+\s*\)\s*(?:PERCENT\s+)?)?((?:\[[\w\s#@]+\]|(?:##?|@)?[\w]+)(?:\.{1,2}(?:\[[\w\s#@]+\]|(?:##?|@)?[\w]+)){0,2})";
+        @"\bUPDATE\s+(?:TOP\s*\(\s*\d+\s*\)\s*(?:PERCENT\s+)?)?(" + NamePartPattern + @"(?:" + SeparatorPattern + NamePartPattern + @"){0,3})";
 
     // FROM bloğu içinde alias tanımını yakalar: tablo_adı alias veya tablo_adı AS alias
     private const string AliasPattern =
-        @"(?:FROM|JOIN)\s+((?:\[[\w\s#@]+\]|(?:##?|@)?[\w]+)(?:\.{1,2}(?:\[[\w\s#@]+\]|(?:##?|@)?[\w]+)){0,2})\s+(?:AS\s+)?([\w]+)";
+        @"(?:FROM|JOIN)\s+(" + NamePartPattern + @"(?:" + SeparatorPattern + NamePartPattern + @"){0,3})\s+(?:AS\s+)?([\w]+)";
 
-    // SET bloğunu yakalar (UPDATE...SET...WHERE/FROM/; arasındaki kısım)
-    private const string SetBlockPattern =
-        @"\bSET\b(.*?)(?:\bWHERE\b|\bFROM\b|;|$)";
-
-    // SET bloğundaki her bir atamayı yakalar: [alias.]kolon = ...
-    private const string ColumnAssignPattern =
-        @"(?:[\w\[\]]+\.)?([\[\w\]]+)\s*=";
+    // NOT: SET bloğu artık regex ile değil, parantez derinliği takip eden
+    // ExtractSetColumns tarayıcısıyla çıkarılıyor (subquery içindeki FROM/WHERE
+    // bloğu erken kesmesin diye).
 
     private static readonly Regex UpdateRegex =
         new(UpdateKeywordPattern, RegexOptions.IgnoreCase | RegexOptions.Compiled);
@@ -34,25 +37,21 @@ public class UpdateStatementAnalyzer
     private static readonly Regex AliasRegex =
         new(AliasPattern, RegexOptions.IgnoreCase | RegexOptions.Compiled | RegexOptions.Singleline);
 
-    private static readonly Regex SetBlockRegex =
-        new(SetBlockPattern, RegexOptions.IgnoreCase | RegexOptions.Compiled | RegexOptions.Singleline);
-
-    private static readonly Regex ColumnAssignRegex =
-        new(ColumnAssignPattern, RegexOptions.IgnoreCase | RegexOptions.Compiled);
-
-    private readonly HashSet<string> _targetTables;
+    // Hedef tablolar: (görünen tam ad, normalize edilmiş parçalar [db, schema, tablo])
+    private readonly List<(string DisplayName, string[] Parts)> _targetTables;
     private readonly bool _verbose;
 
     /// <summary>
     /// Hedef tablo listesi ve verbose modu ile başlatır.
     /// </summary>
-    /// <param name="targetTables">İzlenecek tablo adları (normalize edilmiş, base adlar).</param>
+    /// <param name="targetTables">İzlenecek tablo adları (tam nitelikli olabilir: DB.Schema.Tablo).</param>
     /// <param name="verbose">Konsola adım adım log yazar.</param>
     public UpdateStatementAnalyzer(IEnumerable<string> targetTables, bool verbose = false)
     {
-        _targetTables = new HashSet<string>(
-            targetTables.Select(SqlScriptParser.NormalizeObjectName),
-            StringComparer.OrdinalIgnoreCase);
+        _targetTables = targetTables
+            .Select(t => (t, SplitAndNormalizeParts(t)))
+            .Where(t => t.Item2.Length > 0)
+            .ToList();
         _verbose = verbose;
     }
 
@@ -61,7 +60,12 @@ public class UpdateStatementAnalyzer
     /// </summary>
     /// <param name="spName">SP adı (loglama için).</param>
     /// <param name="spBody">Ham SP CREATE script metni.</param>
-    public SpAnalysisResult Analyze(string spName, string spBody)
+    /// <param name="currentDatabase">
+    /// SP'nin bulunduğu veritabanı (opsiyonel). Verilirse, DB niteliği olmayan referanslar
+    /// (örn. "COR.Account") bu DB ile nitelenir ve hedeflerdeki DB parçasıyla karşılaştırılır.
+    /// Böylece BOA dışı bir DB'deki SP'de geçen "COR.Account", "BOA.COR.Account" hedefiyle eşleşmez.
+    /// </param>
+    public SpAnalysisResult Analyze(string spName, string spBody, string? currentDatabase = null)
     {
         var result = new SpAnalysisResult { SpName = spName };
 
@@ -143,14 +147,15 @@ public class UpdateStatementAnalyzer
                 resolvedTable = normalizedRef;
             }
 
-            // Hedef tablo mu?
-            if (!_targetTables.Contains(resolvedTable))
+            // Hedef tablo mu? (schema/db duyarlı, sağdan hizalı parça karşılaştırması + DB bağlamı)
+            var matchedTarget = MatchTarget(rawResolvedRef, currentDatabase);
+            if (matchedTarget is null)
             {
-                Log($"  Hedef dışı tablo, atlandı: {resolvedTable}");
+                Log($"  Hedef dışı tablo, atlandı: {rawResolvedRef}");
                 continue;
             }
 
-            Log($"  Hedef tablo bulundu: {resolvedTable} (raw: {rawRef})");
+            Log($"  Hedef tablo bulundu: {matchedTarget} (raw: {rawRef})");
 
             // Satır numarasını bul
             var lineNumber = FindLineNumber(originalLines, updateMatch.Index, spBody);
@@ -167,7 +172,7 @@ public class UpdateStatementAnalyzer
             var info = new UpdateStatementInfo
             {
                 RawTableReference = rawRef,
-                NormalizedTableName = resolvedTable,
+                NormalizedTableName = matchedTarget,
                 SetColumns = setColumns,
                 MissingUpdateColumns = missingCols,
                 LineNumber = lineNumber,
@@ -217,29 +222,212 @@ public class UpdateStatementAnalyzer
     }
 
     /// <summary>
+    /// Obje adını normalize edilmiş parçalara ayırır:
+    /// köşeli parantez ve çift tırnaklar kaldırılır, boşluklar kırpılır, nokta ile bölünür.
+    /// "db..tablo" gösteriminde ortadaki boş parça (default schema) korunur (joker sayılır).
+    /// </summary>
+    private static string[] SplitAndNormalizeParts(string name)
+    {
+        return name
+            .Split('.')
+            .Select(p => p.Replace("[", "").Replace("]", "").Replace("\"", "").Trim())
+            .ToArray();
+    }
+
+    /// <summary>
+    /// Ham tablo referansını hedef listesiyle sağdan hizalı parça karşılaştırmasıyla eşler.
+    /// Referans hangi parçaları belirtiyorsa (schema, db) onlar da eşleşmek zorundadır.
+    /// Örn: "BOADWH.LGD.Account" → hedef "BOA.COR.Account" ile EŞLEŞMEZ (LGD ≠ COR).
+    ///      "COR.Account" veya "Account" → "BOA.COR.Account" ile eşleşir
+    ///      (ancak currentDatabase verilmiş ve BOA değilse EŞLEŞMEZ).
+    /// 4 parçalı (LinkedServer.DB.Schema.Table) referanslarda server parçası yok sayılır.
+    /// Boş parça (db..tablo) joker kabul edilir.
+    /// Eşleşen hedefin tam adını, eşleşme yoksa null döner.
+    /// </summary>
+    private string? MatchTarget(string rawReference, string? currentDatabase = null)
+    {
+        var refParts = SplitAndNormalizeParts(rawReference);
+        if (refParts.Length == 0) return null;
+
+        // 4 parçalı ad: linked server parçasını at, karşılaştırma DB.Schema.Table üzerinden yapılır.
+        if (refParts.Length == 4)
+            refParts = refParts[1..];
+
+        // DB bağlamı: referans DB belirtmiyorsa (en fazla schema.tablo) SP'nin DB'si ile nitele.
+        // Böylece hedefteki DB parçası da karşılaştırmaya girer.
+        if (!string.IsNullOrWhiteSpace(currentDatabase) && refParts.Length <= 2)
+        {
+            refParts = refParts.Length == 1
+                ? new[] { currentDatabase.Trim(), "", refParts[0] }   // schema bilinmiyor → joker
+                : new[] { currentDatabase.Trim(), refParts[0], refParts[1] };
+        }
+
+        foreach (var (displayName, targetParts) in _targetTables)
+        {
+            if (MatchesRightAligned(refParts, targetParts))
+                return displayName;
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// İki parça dizisini sağdan hizalayarak karşılaştırır.
+    /// Karşılaştırılan ortak parça sayısı kadar tüm parçalar eşleşmelidir;
+    /// boş parça joker kabul edilir. En az tablo adı (son parça) dolu olmalıdır.
+    /// </summary>
+    private static bool MatchesRightAligned(string[] refParts, string[] targetParts)
+    {
+        var common = Math.Min(refParts.Length, targetParts.Length);
+        if (common == 0) return false;
+
+        for (var i = 1; i <= common; i++)
+        {
+            var rp = refParts[^i];
+            var tp = targetParts[^i];
+
+            // Tablo adı (son parça) joker olamaz, kesin eşleşmeli.
+            if (i == 1)
+            {
+                if (!rp.Equals(tp, StringComparison.OrdinalIgnoreCase))
+                    return false;
+                continue;
+            }
+
+            // Boş parça (db..tablo veya tanımsız schema) joker sayılır.
+            if (rp.Length == 0 || tp.Length == 0)
+                continue;
+
+            if (!rp.Equals(tp, StringComparison.OrdinalIgnoreCase))
+                return false;
+        }
+        return true;
+    }
+
+    /// <summary>
     /// UPDATE ifadesinin hemen ardındaki SET bloğunu bulur, kolon adlarını çıkarır.
+    /// Parantez derinliği takip edilir: SET bloğu yalnızca derinlik 0'daki
+    /// FROM / WHERE / ; ile sonlanır. Böylece SET içindeki subquery'lerin
+    /// FROM/WHERE'leri bloğu erken kesmez ve subquery içindeki '=' karşılaştırmaları
+    /// kolon ataması sanılmaz.
     /// </summary>
     private static List<string> ExtractSetColumns(string sqlFromUpdate, out string setBlock)
     {
         setBlock = string.Empty;
-        var setMatch = SetBlockRegex.Match(sqlFromUpdate);
-        if (!setMatch.Success)
+
+        // 1. Derinlik 0'daki ilk SET anahtar kelimesini bul
+        var setStart = FindKeywordAtDepthZero(sqlFromUpdate, "SET", 0);
+        if (setStart < 0)
             return new List<string>();
 
-        setBlock = setMatch.Groups[1].Value;
-        var columns = new List<string>();
+        var bodyStart = setStart + 3; // "SET" uzunluğu
 
-        var assignMatches = ColumnAssignRegex.Matches(setBlock);
-        foreach (Match m in assignMatches)
+        // 2. SET bloğunun sonunu bul: derinlik 0'da FROM/WHERE/; veya metin sonu
+        var depth = 0;
+        var end = sqlFromUpdate.Length;
+        for (var i = bodyStart; i < sqlFromUpdate.Length; i++)
         {
-            var col = m.Groups[1].Value
-                .Replace("[", "")
-                .Replace("]", "")
-                .Trim();
-            if (!string.IsNullOrWhiteSpace(col) && !IsSqlKeyword(col))
+            var ch = sqlFromUpdate[i];
+            if (ch == '(') { depth++; continue; }
+            if (ch == ')') { depth = Math.Max(0, depth - 1); continue; }
+
+            if (depth > 0) continue;
+
+            if (ch == ';') { end = i; break; }
+
+            if ((ch == 'F' || ch == 'f' || ch == 'W' || ch == 'w')
+                && IsWordBoundary(sqlFromUpdate, i)
+                && (MatchesWord(sqlFromUpdate, i, "FROM") || MatchesWord(sqlFromUpdate, i, "WHERE")))
+            {
+                end = i;
+                break;
+            }
+        }
+
+        setBlock = sqlFromUpdate[bodyStart..end];
+
+        // 3. Derinlik 0'daki virgüllerden atamalara böl,
+        //    her atamanın '=' öncesindeki son tanımlayıcıyı kolon adı olarak al
+        var columns = new List<string>();
+        foreach (var assignment in SplitTopLevel(setBlock, ','))
+        {
+            var eqIndex = FindCharAtDepthZero(assignment, '=');
+            if (eqIndex <= 0) continue;
+
+            var lhs = assignment[..eqIndex].Trim();
+            // alias.kolon → son parça; köşeli parantez/tırnak temizle
+            var col = lhs.Split('.')[^1]
+                .Replace("[", "").Replace("]", "").Replace("\"", "").Trim();
+
+            if (!string.IsNullOrWhiteSpace(col) && !IsSqlKeyword(col)
+                && col.All(c => char.IsLetterOrDigit(c) || c == '_'))
                 columns.Add(col);
         }
         return columns;
+    }
+
+    /// <summary>Derinlik 0'da, kelime sınırlarıyla eşleşen ilk anahtar kelimenin index'ini döner.</summary>
+    private static int FindKeywordAtDepthZero(string text, string keyword, int startIndex)
+    {
+        var depth = 0;
+        for (var i = startIndex; i <= text.Length - keyword.Length; i++)
+        {
+            var ch = text[i];
+            if (ch == '(') { depth++; continue; }
+            if (ch == ')') { depth = Math.Max(0, depth - 1); continue; }
+            if (depth > 0) continue;
+
+            if (IsWordBoundary(text, i) && MatchesWord(text, i, keyword))
+                return i;
+        }
+        return -1;
+    }
+
+    /// <summary>Derinlik 0'daki ilk verilen karakterin index'ini döner, yoksa -1.</summary>
+    private static int FindCharAtDepthZero(string text, char target)
+    {
+        var depth = 0;
+        for (var i = 0; i < text.Length; i++)
+        {
+            var ch = text[i];
+            if (ch == '(') { depth++; continue; }
+            if (ch == ')') { depth = Math.Max(0, depth - 1); continue; }
+            if (depth == 0 && ch == target) return i;
+        }
+        return -1;
+    }
+
+    /// <summary>Metni derinlik 0'daki ayırıcı karakterden parçalara böler.</summary>
+    private static IEnumerable<string> SplitTopLevel(string text, char separator)
+    {
+        var depth = 0;
+        var start = 0;
+        for (var i = 0; i < text.Length; i++)
+        {
+            var ch = text[i];
+            if (ch == '(') { depth++; continue; }
+            if (ch == ')') { depth = Math.Max(0, depth - 1); continue; }
+            if (depth == 0 && ch == separator)
+            {
+                yield return text[start..i];
+                start = i + 1;
+            }
+        }
+        if (start < text.Length)
+            yield return text[start..];
+    }
+
+    /// <summary>Pozisyonun bir kelimenin başlangıcı olup olmadığını kontrol eder.</summary>
+    private static bool IsWordBoundary(string text, int index)
+        => index == 0 || !(char.IsLetterOrDigit(text[index - 1]) || text[index - 1] == '_');
+
+    /// <summary>Pozisyondan itibaren verilen kelimenin (case-insensitive, tam kelime) geçip geçmediğini kontrol eder.</summary>
+    private static bool MatchesWord(string text, int index, string word)
+    {
+        if (index + word.Length > text.Length) return false;
+        if (string.Compare(text, index, word, 0, word.Length, StringComparison.OrdinalIgnoreCase) != 0)
+            return false;
+        var after = index + word.Length;
+        return after >= text.Length || !(char.IsLetterOrDigit(text[after]) || text[after] == '_');
     }
 
     /// <summary>

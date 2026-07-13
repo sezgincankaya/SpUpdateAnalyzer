@@ -157,7 +157,9 @@ public class DatabaseScanner
                     {
                         // Tam niteliklendirme: DB.Schema.SpName
                         var fullName = $"{db}.{spSchema}.{spName}";
-                        result = _analyzer.Analyze(fullName, definition);
+                        // SP'nin DB bağlamı geçilir: DB niteliği olmayan referanslar
+                        // (örn. COR.Account) bu DB ile nitelenip hedeflerle karşılaştırılır.
+                        result = _analyzer.Analyze(fullName, definition, db);
 
                         // DB ve şema bilgisini result'a ekle (raporlama için)
                         result.DatabaseName = db;
